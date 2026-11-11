@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Fullstack Multiplayer Game</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; user-select: none; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            color: white;
+            font-family: Arial, sans-serif;
+            background: rgba(0,0,0,0.7);
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            pointer-events: none;
+        }
+    </style>
+
+    <!-- 1. Three.js va Import Map -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <!-- 2. Socket.io Client Kutubxonasi -->
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+
+    <div id="info">
+        <b>Boshqaruv:</b> WASD — Harakatlanish | Sichqoncha — Kamerani aylantirish<br>
+        <b>Multiplayer & DB:</b> Boshqa o'yinchilarni ko'rasiz va pozitsiyangiz saqlanadi!
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- BACKEND & SOCKET.IO SOZLAMALARI ---
+        const USER_ID = "odiljon_player_" + Math.floor(Math.random() * 1000);
+        const API_URL = "http://localhost:5000/api/position";
+        const socket = io('http://localhost:5000');
+
+        // Scene, Camera, Renderer
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a1a);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Yorug'lik va Pol
+        scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+        dirLight.position.set(5, 10, 7.5);
+        scene.add(dirLight);
+
+        const gridHelper = new THREE.GridHelper(40, 40);
+        scene.add(gridHelper);
+
+        // --- DEVORLAR MASSIVI (COLLISION) ---
+        const walls = [];
+        function createWall(width, height, depth, x, y, z, color = 0xaa4444) {
+            const geometry = new THREE.BoxGeometry(width, height, depth);
+            const material = new THREE.MeshStandardMaterial({ color: color });
+            const wall = new THREE.Mesh(geometry, material);
+            wall.position.set(x, y, z);
+            wall.userData.box = new THREE.Box3().setFromObject(wall);
+            scene.add(wall);
+            walls.push(wall);
+        }
+
+        createWall(4, 2, 0.5, 0, 1, -4);
+        createWall(0.5, 2, 4, -3, 1, -1);
+        createWall(0.5, 2, 4, 3, 1, -1);
+
+        // --- KLAVIATURA VA MOUSE BOSHQARUVI ---
+        const keys = { w: false, a: false, s: false, d: false };
+        window.addEventListener('keydown', (e) => {
+            const k = e.key.toLowerCase();
+            if (keys.hasOwnProperty(k)) keys[k] = true;
+        });
+        window.addEventListener('keyup', (e) => {
+            const k = e.key.toLowerCase();
+            if (keys.hasOwnProperty(k)) keys[k] = false;
+        });
+
+        let isMouseDown = false;
+        let mouseX = 0, mouseY = 0;
+        let cameraTheta = Math.PI; 
+        let cameraPhi = Math.PI / 4;  
+        const cameraDistance = 4;     
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.button === 0) { isMouseDown = true; mouseX = e.clientX; mouseY = e.clientY; }
+        });
+        window.addEventListener('mouseup', () => isMouseDown = false);
+        window.addEventListener('mousemove', (e) => {
+            if (!isMouseDown) return;
+            const deltaX = e.clientX - mouseX;
+            const deltaY = e.clientY - mouseY;
+            cameraTheta -= deltaX * 0.005;
+            cameraPhi -= deltaY * 0.005;
+            cameraPhi = Math.max(0.1, Math.min(Math.PI / 2 - 0.05, cameraPhi));
+            mouseX = e.clientX; mouseY = e.clientY;
+        });
+
+        // --- O'ZGARUVCHILAR ---
+        let model = null;
+        let mixer = null;
+        let actions = {};
+        let activeAction = null;
+        let isWalking = false;
+        const clock = new THREE.Clock();
+        const moveSpeed = 4;
+
+        // Boshqa o'yinchilar lug'ati
+        const otherPlayers = {};
+
+        // --- MONGODB API VA SOCKET.IO MULTIPLAYER ---
+        async function loadSavedPosition() {
+            try {
+                const response = await fetch(`${API_URL}/${USER_ID}`);
+                const data = await response.json();
+                if (model && data) {
+                    model.position.set(data.x, data.y, data.z);
+                }
+            } catch (err) { console.error("Pozitsiyani yuklab bo'lmadi:", err); }
+        }
+
+        async function savePositionToDB() {
+            if (!model) return;
+            try {
+                await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId: USER_ID, x: model.position.x, y: model.position.y, z: model.position.z })
+                });
+            } catch (err) { console.error("Saqlashda xatolik:", err); }
+        }
+
+        // Socket.io hodisalari
+        socket.on('currentPlayersUpdate', (data) => {
+            if (!otherPlayers[data.id]) {
+                const loader = new GLTFLoader();
+                loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Fox/glTF-Binary/Fox.glb', (gltf) => {
+                    const remoteModel = gltf.scene;
+                    remoteModel.scale.set(0.02, 0.02, 0.02);
+                    scene.add(remoteModel);
+                    otherPlayers[data.id] = remoteModel;
+                });
+            } else {
+                const p = otherPlayers[data.id];
+                p.position.set(data.x, data.y, data.z);
+                p.rotation.y = data.rotationY;
+            }
+        });
+
+        socket.on('removePlayer', (id) => {
+            if (otherPlayers[id]) {
+                scene.remove(otherPlayers[id]);
+                delete otherPlayers[id];
+            }
+        });
+
+        // --- MODELNI YUKLASH ---
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Fox/glTF-Binary/Fox.glb',
+            (gltf) => {
+                model = gltf.scene;
+                model.scale.set(0.02, 0.02, 0.02);
+                scene.add(model);
+
+                mixer = new THREE.AnimationMixer(model);
+                if (gltf.animations.length >= 3) {
+                    actions['idle'] = mixer.clipAction(gltf.animations[0]);
+                    actions['walk'] = mixer.clipAction(gltf.animations[2]);
+                    activeAction = actions['idle'];
+                    activeAction.play();
+                }
+
+                loadSavedPosition();
+            }
+        );
+
+        function updateCamera() {
+            if (!model) return;
+            const targetPosition = model.position.clone().add(new THREE.Vector3(0, 1.2, 0));
+            const x = targetPosition.x + cameraDistance * Math.sin(cameraPhi) * Math.sin(cameraTheta);
+            const y = targetPosition.y + cameraDistance * Math.cos(cameraPhi);
+            const z = targetPosition.z + cameraDistance * Math.sin(cameraPhi) * Math.cos(cameraTheta);
+
+            camera.position.set(x, y, z);
+            camera.lookAt(targetPosition);
+        }
+
+        // --- RENDER LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            if (model && mixer) {
+                const forward = new THREE.Vector3();
+                camera.getWorldDirection(forward);
+                forward.y = 0;
+                forward.normalize();
+
+                const side = new THREE.Vector3();
+                side.crossVectors(new THREE.Vector3(0, 1, 0), forward).normalize();
+
+                const moveVector = new THREE.Vector3(0, 0, 0);
+                if (keys.w) moveVector.add(forward);
+                if (keys.s) moveVector.sub(forward);
+                if (keys.d) moveVector.sub(side);
+                if (keys.a) moveVector.add(side);
+
+                if (moveVector.lengthSq() > 0) {
+                    moveVector.normalize();
+                    const nextPosition = model.position.clone();
+                    nextPosition.addScaledVector(moveVector, moveSpeed * delta);
+
+                    const playerBox = new THREE.Box3().setFromObject(model);
+                    const movementVector = nextPosition.clone().sub(model.position);
+                    playerBox.translate(movementVector);
+
+                    const isColliding = walls.some(wall => playerBox.intersectsBox(wall.userData.box));
+
+                    if (!isColliding) {
+                        model.position.copy(nextPosition);
+                        const targetAngle = Math.atan2(moveVector.x, moveVector.z);
+                        model.rotation.y = targetAngle;
+
+                        // Serverga pozitsiyani uzatish (Multiplayer)
+                        socket.emit('playerMove', {
+                            x: model.position.x,
+                            y: model.position.y,
+                            z: model.position.z,
+                            rotationY: model.rotation.y
+                        });
+
+                        if (!isWalking && actions['walk']) {
+                            activeAction.fadeOut(0.2);
+                            activeAction = actions['walk'];
+                            activeAction.reset().fadeIn(0.2).play();
+                            isWalking = true;
+                        }
+                    } else {
+                        if (isWalking && actions['idle']) {
+                            activeAction.fadeOut(0.2);
+                            activeAction = actions['idle'];
+                            activeAction.reset().fadeIn(0.2).play();
+                            isWalking = false;
+                            savePositionToDB();
+                        }
+                    }
+                } else {
+                    if (isWalking && actions['idle']) {
+                        activeAction.fadeOut(0.2);
+                        activeAction = actions['idle'];
+                        activeAction.reset().fadeIn(0.2).play();
+                        isWalking = false;
+                        savePositionToDB();
+                    }
+                }
+
+                mixer.update(delta);
+            }
+
+            updateCamera();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
